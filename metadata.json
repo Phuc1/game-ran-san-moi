@@ -1,0 +1,6 @@
+{
+  "name": "Rắn Săn Mồi",
+  "description": "Trò chơi rắn săn mồi 4D offline siêu mượt, đồ họa neon 3D/4D cực đỉnh và tối ưu hóa hiệu năng tối đa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
