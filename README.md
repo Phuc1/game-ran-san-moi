@@ -27,3 +27,13 @@ KEYSTORE_PATH=/path/to/upload-key.jks STORE_PASSWORD=... KEY_PASSWORD=... ./grad
 ```
 
 Never commit `*.jks` / `*.keystore` (already in `.gitignore`).
+
+## Tests
+
+Game rules live in `GameEngine` (pure Kotlin, no Android deps) and are unit-tested:
+
+```
+./gradlew testDebugUnitTest
+```
+
+CI (`.gitlab-ci.yml`) runs unit tests + lint on every pipeline, builds a debug APK on branches/MRs and a signed AAB on the default branch and tags.
