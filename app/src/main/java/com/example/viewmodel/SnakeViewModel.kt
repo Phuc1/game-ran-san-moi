@@ -14,10 +14,18 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.random.Random
 
 enum class Direction {
     UP, DOWN, LEFT, RIGHT
+}
+
+fun Direction.opposite(): Direction = when (this) {
+    Direction.UP -> Direction.DOWN
+    Direction.DOWN -> Direction.UP
+    Direction.LEFT -> Direction.RIGHT
+    Direction.RIGHT -> Direction.LEFT
 }
 
 enum class GameState {
@@ -93,12 +101,13 @@ class SnakeViewModel(
     val particles = mutableStateListOf<Particle>()
 
     private var gameLoopJob: Job? = null
-    private var particleLoopJob: Job? = null
-    private var timeMillis = 0L
+    private var effectsJob: Job? = null
+
+    // Turns queued between ticks (max 2) so fast double-swipes are honoured in order
+    private val pendingDirs = ArrayDeque<Direction>()
 
     init {
         resetGame()
-        startParticleSimulation()
     }
 
     private fun calculateSpeedMs(level: Int, speed: GameSpeed): Long {
@@ -122,17 +131,12 @@ class SnakeViewModel(
     }
 
     fun changeDirection(newDir: Direction) {
-        val currentDir = _uiState.value.direction
-        // Prevent 180-degree immediate reverse collisions
-        val isValid = when (newDir) {
-            Direction.UP -> currentDir != Direction.DOWN
-            Direction.DOWN -> currentDir != Direction.UP
-            Direction.LEFT -> currentDir != Direction.RIGHT
-            Direction.RIGHT -> currentDir != Direction.LEFT
-        }
-        if (isValid && _uiState.value.gameState == GameState.PLAYING) {
-            _uiState.update { it.copy(direction = newDir) }
-        }
+        if (_uiState.value.gameState != GameState.PLAYING) return
+        // Validate against the LAST queued turn, not the on-screen heading:
+        // prevents UP->LEFT inside one tick from reversing into the neck.
+        val last = pendingDirs.lastOrNull() ?: _uiState.value.direction
+        if (newDir == last || newDir == last.opposite()) return
+        if (pendingDirs.size < 2) pendingDirs.addLast(newDir)
     }
 
     fun startGame() {
@@ -160,7 +164,14 @@ class SnakeViewModel(
         }
     }
 
+    fun exitToMenu() {
+        gameLoopJob?.cancel()
+        particles.clear()
+        resetGame() // back to IDLE (menu)
+    }
+
     private fun resetGame() {
+        pendingDirs.clear()
         val w = _uiState.value.gridWidth
         val h = _uiState.value.gridHeight
         val startLength = 3
@@ -223,12 +234,12 @@ class SnakeViewModel(
         }
     }
 
-    private fun startParticleSimulation() {
-        particleLoopJob?.cancel()
-        particleLoopJob = viewModelScope.launch {
-            while (true) {
-                delay(16L) // ~60 FPS
-                timeMillis += 16L
+    // Runs only while there is something to animate; stops by itself (no idle 60 Hz loop).
+    private fun kickEffects() {
+        if (effectsJob?.isActive == true) return
+        effectsJob = viewModelScope.launch {
+            while (particles.isNotEmpty() || _uiState.value.cameraShake > 0f) {
+                delay(16L)
                 updateParticles()
                 decayCameraShake()
             }
@@ -239,12 +250,11 @@ class SnakeViewModel(
         val state = _uiState.value
         val snake = state.snake.toMutableList()
         val head = snake.first()
-        val dir = state.direction
+        // Consume at most one queued turn per tick; fall back to the current heading.
+        val dir = pendingDirs.removeFirstOrNull() ?: state.direction
 
-        // Compute next head position
         var nextX = head.x
         var nextY = head.y
-
         when (dir) {
             Direction.UP -> nextY -= 1
             Direction.DOWN -> nextY += 1
@@ -252,143 +262,144 @@ class SnakeViewModel(
             Direction.RIGHT -> nextX += 1
         }
 
-        val hasWalls = state.selectedSpeed.hasWalls
         val w = state.gridWidth
         val h = state.gridHeight
 
-        // Wall collision check / Wrap around
+        // Working copies: every mutation below is applied to these locals and committed
+        // in ONE state update at the end, so the shield can never be spent twice in a tick.
+        var shield = state.hasShield
+        var obstacles = state.obstacles
+        var shake = 0f
+
+        // Wall collision / wrap-around
         if (nextX < 0 || nextX >= w || nextY < 0 || nextY >= h) {
-            if (hasWalls) {
-                if (state.hasShield) {
-                    // Expend shield instead of death, wrap anyway
-                    _uiState.update { it.copy(hasShield = false, cameraShake = 0.4f) }
-                    triggerShieldSparks(nextX, nextY)
-                    nextX = (nextX + w) % w
-                    nextY = (nextY + h) % h
-                } else {
+            if (state.selectedSpeed.hasWalls) {
+                if (!shield) {
                     triggerGameOver()
                     return
                 }
-            } else {
-                // Wrap around
-                nextX = (nextX + w) % w
-                nextY = (nextY + h) % h
+                shield = false
+                shake = maxOf(shake, 0.4f)
             }
+            val shieldUsed = state.selectedSpeed.hasWalls
+            nextX = (nextX + w) % w
+            nextY = (nextY + h) % h
+            if (shieldUsed) triggerShieldSparks(nextX, nextY)
         }
 
         val nextHead = Point(nextX, nextY)
 
-        // Self-collision checking
-        if (snake.contains(nextHead) && nextHead != snake.last()) {
-            if (state.hasShield) {
-                _uiState.update { it.copy(hasShield = false, cameraShake = 0.5f) }
-                triggerShieldSparks(nextHead.x, nextHead.y)
-            } else {
+        // Self collision (the tail cell is vacated this tick, so stepping onto it is legal)
+        if (nextHead != snake.last() && snake.contains(nextHead)) {
+            if (!shield) {
                 triggerGameOver()
                 return
             }
+            shield = false
+            shake = maxOf(shake, 0.5f)
+            triggerShieldSparks(nextHead.x, nextHead.y)
         }
 
-        // Obstacle-collision checking
-        if (state.obstacles.contains(nextHead)) {
-            if (state.hasShield) {
-                // Shield shatters, destroys obstacle satisfyingly!
-                val updatedObstacles = state.obstacles.filter { it != nextHead }
-                _uiState.update { it.copy(obstacles = updatedObstacles, hasShield = false, cameraShake = 0.6f) }
-                triggerShieldSparks(nextHead.x, nextHead.y)
-            } else {
+        // Obstacle collision
+        if (obstacles.contains(nextHead)) {
+            if (!shield) {
                 triggerGameOver()
                 return
             }
+            // Shield shatters and destroys the obstacle
+            obstacles = obstacles.filter { it != nextHead }
+            shield = false
+            shake = maxOf(shake, 0.6f)
+            triggerShieldSparks(nextHead.x, nextHead.y)
         }
 
-        // Add head
         snake.add(0, nextHead)
 
-        // Check if head eats food
-        var foodIndex = -1
-        for (i in state.foods.indices) {
-            if (state.foods[i].point == nextHead) {
-                foodIndex = i
-                break
-            }
-        }
+        val eatenIndex = state.foods.indexOfFirst { it.point == nextHead }
+        val ate = eatenIndex != -1
 
-        if (foodIndex != -1) {
-            // Ate food!
-            val eatenFood = state.foods[foodIndex]
-            val scoreGained = when (eatenFood.type) {
+        var score = state.score
+        var length = state.snakeLength
+        var level = state.level
+        var speedMs = state.currentSpeedMs
+        var foods = state.foods
+        var warp = state.isWarpActive
+
+        if (ate) {
+            val eaten = state.foods[eatenIndex]
+            val gain = when (eaten.type) {
                 FoodType.NORMAL -> 10
                 FoodType.PORTAL -> 30
                 FoodType.SHIELD -> 20
             }
+            if (eaten.type == FoodType.SHIELD) shield = true
 
-            var shieldState = state.hasShield
-            if (eatenFood.type == FoodType.SHIELD) {
-                shieldState = true
-            }
+            triggerFoodConsumptionSparks(nextHead.x, nextHead.y, eaten.type)
 
-            // Spawn explosive particle sparks on eaten food
-            triggerFoodConsumptionSparks(nextHead.x, nextHead.y, eatenFood.type)
-
-            // Trigger score increment & camera shake
-            val newScore = state.score + scoreGained
+            // Multiplier applies to the GAIN only (applying it to the running total compounds exponentially).
             val multiplier = if (state.selectedSpeed == GameSpeed.HYPER_4D) 1.5 else 1.0
-            val finalScore = (newScore * multiplier).toInt()
+            score += (gain * multiplier).toInt()
 
-            val newLength = state.snakeLength + 1
-            val newLevel = ((newLength - 3) / 3) + 1
-            val nextSpeedMs = calculateSpeedMs(newLevel, state.selectedSpeed)
-            val levelUpTriggered = newLevel > state.level
+            length += 1
+            val newLevel = ((length - 3) / 3) + 1
+            speedMs = calculateSpeedMs(newLevel, state.selectedSpeed)
+            warp = eaten.type == FoodType.PORTAL
+            foods = foods.filterIndexed { i, _ -> i != eatenIndex }
 
-            val newObstacles = state.obstacles.toMutableList()
-            if (levelUpTriggered) {
+            val levelUp = newLevel > level
+            level = newLevel
+            shake = maxOf(shake, if (levelUp) 0.7f else 0.3f)
+
+            if (levelUp) {
                 triggerLevelUpSparks(nextHead.x, nextHead.y)
-                // Add new obstacles dynamically as difficulty increases with levels!
-                var attempts = 0
-                while (attempts < 50) {
-                    val p = Point(Random.nextInt(w), Random.nextInt(h))
-                    if (!snake.contains(p) && state.foods.none { it.point == p } && !newObstacles.contains(p)) {
-                        newObstacles.add(p)
-                        triggerLevelUpSparks(p.x, p.y) // Beautiful sparks at new obstacle position
-                        break
+                // New obstacle on a free cell that is not right in front of the head (unavoidable death otherwise)
+                val occupied = HashSet<Point>().apply {
+                    addAll(snake)
+                    addAll(obstacles)
+                    foods.forEach { add(it.point) }
+                }
+                val candidates = ArrayList<Point>()
+                for (x in 0 until w) {
+                    for (y in 0 until h) {
+                        val p = Point(x, y)
+                        if (p !in occupied && abs(p.x - nextHead.x) + abs(p.y - nextHead.y) > 3) {
+                            candidates.add(p)
+                        }
                     }
-                    attempts++
+                }
+                if (candidates.isNotEmpty()) {
+                    val p = candidates[Random.nextInt(candidates.size)]
+                    obstacles = obstacles + p
+                    triggerLevelUpSparks(p.x, p.y)
                 }
             }
-
-            _uiState.update {
-                it.copy(
-                    score = finalScore,
-                    snakeLength = newLength,
-                    level = newLevel,
-                    currentSpeedMs = nextSpeedMs,
-                    hasShield = shieldState,
-                    obstacles = newObstacles,
-                    cameraShake = if (levelUpTriggered) 0.7f else 0.3f,
-                    isWarpActive = eatenFood.type == FoodType.PORTAL
-                )
-            }
-
-            // Spawn ambient sparkle around head
-            triggerTailGrowthSparks(snake.last().x, snake.last().y)
-
-            // Spawn new foods
-            val currentFoods = state.foods.toMutableList()
-            currentFoods.removeAt(foodIndex)
-            _uiState.update { it.copy(foods = currentFoods) }
-            
-            spawnFood()
-        } else {
-            // Keep length constant - remove tail
-            if (snake.size > state.snakeLength) {
-                snake.removeAt(snake.size - 1)
-            }
+        } else if (snake.size > length) {
+            snake.removeAt(snake.size - 1)
         }
 
-        _uiState.update { it.copy(snake = snake) }
+        // Single atomic commit (snake included, so spawnFood below sees the new head)
+        _uiState.update {
+            it.copy(
+                snake = snake,
+                direction = dir,
+                foods = foods,
+                obstacles = obstacles,
+                hasShield = shield,
+                score = score,
+                snakeLength = length,
+                level = level,
+                currentSpeedMs = speedMs,
+                isWarpActive = warp,
+                cameraShake = maxOf(it.cameraShake, shake)
+            )
+        }
 
-        // Spawn a subtle tail trail spark occasionally
+        if (ate) {
+            triggerTailGrowthSparks(snake.last().x, snake.last().y)
+            spawnFood()
+        }
+
+        // Subtle tail trail spark
         if (Random.nextFloat() < 0.2f && snake.isNotEmpty()) {
             val tail = snake.last()
             addParticle(
@@ -397,48 +408,46 @@ class SnakeViewModel(
                 vx = (Random.nextFloat() - 0.5f) * 0.05f,
                 vy = (Random.nextFloat() - 0.5f) * 0.05f,
                 size = 6f + Random.nextFloat() * 8f,
-                color = 0xFF8A2BE2, // Purple
+                color = 0xFF8A2BE2,
                 decay = 0.04f
             )
         }
+        kickEffects()
     }
 
     private fun spawnFood() {
         val state = _uiState.value
-        val currentFoods = state.foods.toMutableList()
-        val snake = state.snake
         val w = state.gridWidth
         val h = state.gridHeight
+        val required = if (state.selectedSpeed == GameSpeed.HYPER_4D) 3 else 1
+        val foods = state.foods.toMutableList()
 
-        // Generate food items so they don't overlap snake or other foods
-        val requiredFoodCount = if (state.selectedSpeed == GameSpeed.HYPER_4D) 3 else 1
-        
-        while (currentFoods.size < requiredFoodCount) {
-            var attempts = 0
-            var foundPoint: Point? = null
-            while (attempts < 100) {
-                val p = Point(Random.nextInt(w), Random.nextInt(h))
-                if (!snake.contains(p) && currentFoods.none { it.point == p } && !state.obstacles.contains(p)) {
-                    foundPoint = p
-                    break
-                }
-                attempts++
+        // Pick only from genuinely free cells (never overlaps snake / obstacles / other food)
+        val occupied = HashSet<Point>().apply {
+            addAll(state.snake)
+            addAll(state.obstacles)
+            foods.forEach { add(it.point) }
+        }
+        val free = ArrayList<Point>()
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                val p = Point(x, y)
+                if (p !in occupied) free.add(p)
             }
-
-            val targetPoint = foundPoint ?: Point(Random.nextInt(w), Random.nextInt(h))
-
-            // Choose food type with neon-balancing
-            val roll = Random.nextFloat()
-            val type = when {
-                roll < 0.12f -> FoodType.SHIELD // Green Shield
-                roll < 0.28f -> FoodType.PORTAL // Golden Portal
-                else -> FoodType.NORMAL        // Crimson Core
-            }
-
-            currentFoods.add(Food(targetPoint, type))
         }
 
-        _uiState.update { it.copy(foods = currentFoods) }
+        while (foods.size < required && free.isNotEmpty()) {
+            val p = free.removeAt(Random.nextInt(free.size))
+            val roll = Random.nextFloat()
+            val type = when {
+                roll < 0.12f -> FoodType.SHIELD
+                roll < 0.28f -> FoodType.PORTAL
+                else -> FoodType.NORMAL
+            }
+            foods.add(Food(p, type))
+        }
+
+        _uiState.update { it.copy(foods = foods) }
     }
 
     fun saveScoreOffline(playerName: String, onFinished: () -> Unit) {
@@ -466,6 +475,7 @@ class SnakeViewModel(
     private fun triggerGameOver() {
         _uiState.update { it.copy(gameState = GameState.GAME_OVER, cameraShake = 0.9f) }
         gameLoopJob?.cancel()
+        kickEffects()
 
         // Cataclysmic graphic explosion spark burst on entire board!
         val snake = _uiState.value.snake
@@ -491,6 +501,7 @@ class SnakeViewModel(
         if (particles.size > 200) {
             particles.removeAt(0) // Prevent memory/allocation bloat, keeping sizing featherweight!
         }
+        kickEffects()
         particles.add(
             Particle(
                 x = x,

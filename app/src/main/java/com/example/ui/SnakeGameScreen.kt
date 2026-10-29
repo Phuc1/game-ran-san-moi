@@ -45,10 +45,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.ScoreEntity
 import com.example.viewmodel.*
 import kotlinx.coroutines.delay
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
@@ -87,6 +91,16 @@ fun SnakeGameApp(
         if (state.gameState == GameState.GAME_OVER && state.hapticsEnabled) {
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         }
+    }
+
+    // Pause automatically when the app goes to background (otherwise the snake keeps moving and dies)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) viewModel.pauseGame()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // High Score saving modal state
@@ -144,9 +158,8 @@ fun SnakeGameApp(
                             else viewModel.resumeGame()
                         },
                         onExitClicked = {
-                            viewModel.pauseGame()
                             showSaveDialog = false
-                            viewModel.startGame() // Reset or trigger back
+                            viewModel.exitToMenu()
                         }
                     )
                 }
@@ -535,8 +548,6 @@ fun GamePlayLayout(
     onExitClicked: () -> Unit
 ) {
     // Collect swipe gesture events
-    var swipeOffsetStartX by remember { mutableStateOf(0f) }
-    var swipeOffsetStartY by remember { mutableStateOf(0f) }
     val density = LocalDensity.current
 
     // Request keyboard focus for laptop arrow & WASD keys
@@ -767,32 +778,24 @@ fun GamePlayLayout(
                 .background(NeonTheme.DeepSpace)
                 .border(2.dp, NeonTheme.GridAccent, RoundedCornerShape(18.dp))
                 .pointerInput(Unit) {
+                    // Accumulate drag distance; emit one turn per threshold crossing, then reset.
+                    var acc = Offset.Zero
+                    val threshold = viewConfiguration.touchSlop * 2f
                     detectDragGestures(
-                        onDragStart = { offset ->
-                            swipeOffsetStartX = offset.x
-                            swipeOffsetStartY = offset.y
-                        },
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                        },
-                        onDragEnd = {
-                            val diffX = swipeOffsetStartX
-                            val diffY = swipeOffsetStartY
-                            // Compute swipe calculations manually to give 100% swipe responsive controls
-                        }
-                    )
-                }
-                .pointerInput(Unit) {
-                    // Simpler gesture swipe detector
-                    detectDragGestures { change, dragAmount ->
+                        onDragStart = { acc = Offset.Zero },
+                        onDragEnd = { acc = Offset.Zero },
+                        onDragCancel = { acc = Offset.Zero }
+                    ) { change, dragAmount ->
                         change.consume()
-                        val (x, y) = dragAmount
-                        if (Math.abs(x) > Math.abs(y)) {
-                            if (x > 15f) onDirectionChange(Direction.RIGHT)
-                            else if (x < -15f) onDirectionChange(Direction.LEFT)
-                        } else {
-                            if (y > 15f) onDirectionChange(Direction.DOWN)
-                            else if (y < -15f) onDirectionChange(Direction.UP)
+                        acc += dragAmount
+                        if (abs(acc.x) > threshold || abs(acc.y) > threshold) {
+                            val dir = if (abs(acc.x) > abs(acc.y)) {
+                                if (acc.x > 0) Direction.RIGHT else Direction.LEFT
+                            } else {
+                                if (acc.y > 0) Direction.DOWN else Direction.UP
+                            }
+                            onDirectionChange(dir)
+                            acc = Offset.Zero
                         }
                     }
                 }
