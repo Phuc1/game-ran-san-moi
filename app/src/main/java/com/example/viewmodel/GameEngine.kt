@@ -10,7 +10,7 @@ sealed interface GameEvent {
     data class TailGrew(val at: Point) : GameEvent
     data class LevelUp(val at: Point) : GameEvent
     data class ObstacleSpawned(val at: Point) : GameEvent
-    data object GameOver : GameEvent
+    data class GameOver(val cause: DeathCause) : GameEvent
 }
 
 data class StepResult(val state: GameUiState, val events: List<GameEvent>)
@@ -19,7 +19,12 @@ data class StepResult(val state: GameUiState, val events: List<GameEvent>)
  * Game rules with zero Android dependencies. All randomness comes from [random]
  * so tests can seed it. Not thread-safe: call from a single thread (the main thread in the app).
  */
-class GameEngine(private val random: Random = Random.Default) {
+class GameEngine(
+    private val random: Random = Random.Default,
+    /** When set, layout/food/obstacle positions are derived from this seed so everyone gets the same daily board. */
+    private val dailySeed: Long? = null
+) {
+    private var spawnCounter = 0L
 
     // Turns queued between ticks (max [MAX_QUEUED_TURNS]) so fast double swipes are honoured in order.
     private val pendingDirs = ArrayDeque<Direction>()
@@ -36,6 +41,7 @@ class GameEngine(private val random: Random = Random.Default) {
         hapticsEnabled: Boolean = true
     ): GameUiState {
         pendingDirs.clear()
+        spawnCounter = 0L
 
         val startLength = 3
         val startY = height / 2
@@ -55,7 +61,7 @@ class GameEngine(private val random: Random = Random.Default) {
                 if (!nearSnake) candidates.add(Point(x, y))
             }
         }
-        candidates.shuffle(random)
+        candidates.shuffle(if (dailySeed != null) Random(dailySeed) else random)
         val obstacles = candidates.take(obstacleCount)
 
         val state = GameUiState(
@@ -116,7 +122,7 @@ class GameEngine(private val random: Random = Random.Default) {
         if (nextX < 0 || nextX >= w || nextY < 0 || nextY >= h) {
             val deadly = state.selectedSpeed.hasWalls
             if (deadly) {
-                if (!shield) return gameOver(state, events)
+                if (!shield) return gameOver(state, events, DeathCause.WALL)
                 shield = false
                 shake = maxOf(shake, 0.4f)
             }
@@ -129,7 +135,7 @@ class GameEngine(private val random: Random = Random.Default) {
 
         // Self collision (the tail cell is vacated this tick, so stepping onto it is legal)
         if (nextHead != snake.last() && snake.contains(nextHead)) {
-            if (!shield) return gameOver(state, events)
+            if (!shield) return gameOver(state, events, DeathCause.SELF)
             shield = false
             shake = maxOf(shake, 0.5f)
             events += GameEvent.ShieldBroken(nextHead)
@@ -137,7 +143,7 @@ class GameEngine(private val random: Random = Random.Default) {
 
         // Obstacle collision
         if (obstacles.contains(nextHead)) {
-            if (!shield) return gameOver(state, events)
+            if (!shield) return gameOver(state, events, DeathCause.OBSTACLE)
             obstacles = obstacles.filter { it != nextHead } // shield shatters and destroys the obstacle
             shield = false
             shake = maxOf(shake, 0.6f)
@@ -188,17 +194,11 @@ class GameEngine(private val random: Random = Random.Default) {
                     foods.forEach { add(it.point) }
                 }
                 // Free cell that is not right in front of the head (otherwise death is unavoidable)
-                val candidates = ArrayList<Point>()
-                for (x in 0 until w) {
-                    for (y in 0 until h) {
-                        val p = Point(x, y)
-                        if (p !in occupied && abs(p.x - nextHead.x) + abs(p.y - nextHead.y) > SAFE_RADIUS) {
-                            candidates.add(p)
-                        }
-                    }
+                val obstacleRandom = if (dailySeed != null) Random(dailySeed * 31 + newLevel) else random
+                val p = pickFreeCell(obstacleRandom, w, h) {
+                    it !in occupied && abs(it.x - nextHead.x) + abs(it.y - nextHead.y) > SAFE_RADIUS
                 }
-                if (candidates.isNotEmpty()) {
-                    val p = candidates[random.nextInt(candidates.size)]
+                if (p != null) {
                     obstacles = obstacles + p
                     events += GameEvent.ObstacleSpawned(p)
                 }
@@ -238,17 +238,13 @@ class GameEngine(private val random: Random = Random.Default) {
             addAll(state.obstacles)
             foods.forEach { add(it.point) }
         }
-        val free = ArrayList<Point>()
-        for (x in 0 until state.gridWidth) {
-            for (y in 0 until state.gridHeight) {
-                val p = Point(x, y)
-                if (p !in occupied) free.add(p)
-            }
-        }
+        // Daily mode: one fresh seeded stream per spawn call, so the k-th food is the same for every player.
+        val rnd = if (dailySeed != null) Random(dailySeed + spawnCounter++) else random
 
-        while (foods.size < required && free.isNotEmpty()) {
-            val p = free.removeAt(random.nextInt(free.size))
-            val roll = random.nextFloat()
+        while (foods.size < required) {
+            val roll = rnd.nextFloat() // drawn first so the food type never depends on how many cells were rejected
+            val p = pickFreeCell(rnd, state.gridWidth, state.gridHeight) { it !in occupied } ?: break
+            occupied.add(p)
             val type = when {
                 roll < 0.12f -> FoodType.SHIELD
                 roll < 0.28f -> FoodType.PORTAL
@@ -259,11 +255,31 @@ class GameEngine(private val random: Random = Random.Default) {
         return state.copy(foods = foods)
     }
 
-    private fun gameOver(state: GameUiState, events: MutableList<GameEvent>): StepResult {
+    /** Rejection sampling first (stable across players for the same seed), exhaustive scan as a fallback. */
+    private fun pickFreeCell(rnd: Random, w: Int, h: Int, ok: (Point) -> Boolean): Point? {
+        repeat(RANDOM_TRIES) {
+            val p = Point(rnd.nextInt(w), rnd.nextInt(h))
+            if (ok(p)) return p
+        }
+        val free = ArrayList<Point>()
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                val p = Point(x, y)
+                if (ok(p)) free.add(p)
+            }
+        }
+        return if (free.isEmpty()) null else free[rnd.nextInt(free.size)]
+    }
+
+    private fun gameOver(state: GameUiState, events: MutableList<GameEvent>, cause: DeathCause): StepResult {
         pendingDirs.clear()
-        events += GameEvent.GameOver
+        events += GameEvent.GameOver(cause)
         return StepResult(
-            state.copy(gameState = GameState.GAME_OVER, cameraShake = maxOf(state.cameraShake, 0.9f)),
+            state.copy(
+                gameState = GameState.GAME_OVER,
+                cameraShake = maxOf(state.cameraShake, 0.9f),
+                deathCause = cause
+            ),
             events
         )
     }
@@ -272,5 +288,6 @@ class GameEngine(private val random: Random = Random.Default) {
         const val MIN_TICK_MS = 40L
         const val MAX_QUEUED_TURNS = 2
         const val SAFE_RADIUS = 3
+        const val RANDOM_TRIES = 64
     }
 }

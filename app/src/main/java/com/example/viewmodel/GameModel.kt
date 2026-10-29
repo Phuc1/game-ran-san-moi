@@ -47,6 +47,8 @@ enum class GameSpeed(val label: String, val ms: Long, val hasWalls: Boolean) {
     HYPER_4D("HYPER 4D", 120L, true)
 }
 
+enum class DeathCause { WALL, SELF, OBSTACLE }
+
 data class GameUiState(
     val snake: List<Point> = emptyList(),
     val direction: Direction = Direction.RIGHT,
@@ -64,5 +66,9 @@ data class GameUiState(
     val isWarpActive: Boolean = false,
     val hapticsEnabled: Boolean = true,
     val gridWidth: Int = 20,
-    val gridHeight: Int = 20
+    val gridHeight: Int = 20,
+    val isDaily: Boolean = false,
+    val dailyDay: Long = 0L,
+    val deathCause: DeathCause? = null,
+    val roast: String = ""
 )

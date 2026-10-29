@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.TimeZone
 import kotlin.random.Random
 
 /**
@@ -22,11 +23,17 @@ import kotlin.random.Random
  */
 class SnakeViewModel(
     private val repository: ScoreRepository,
-    private val engine: GameEngine = GameEngine()
+    private val statsStorage: StatsStorage,
+    private var engine: GameEngine = GameEngine(),
+    private val clock: () -> Long = { System.currentTimeMillis() }
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(engine.newGame(DEFAULT_GRID, DEFAULT_GRID, GameSpeed.MEDIUM))
     val uiState: StateFlow<GameUiState> = _uiState.asStateFlow()
+
+    // Streak + daily best (persisted in SharedPreferences)
+    private val _stats = MutableStateFlow(statsStorage.load())
+    val stats: StateFlow<PlayerStats> = _stats.asStateFlow()
 
     // Top scores observed reactively from Room
     val topScores: StateFlow<List<ScoreEntity>> = repository.getTopScores(10)
@@ -59,6 +66,31 @@ class SnakeViewModel(
         val state = _uiState.value
         if (state.gameState != GameState.PLAYING) return
         engine.queueDirection(state.direction, newDir)
+    }
+
+    /** Local-calendar day number (same for everyone in the same timezone and date). */
+    fun todayEpochDay(): Long {
+        val now = clock()
+        return DailyChallenge.epochDay(now, TimeZone.getDefault().getOffset(now))
+    }
+
+    fun todayLabel(): String = DailyChallenge.label(todayEpochDay())
+
+    /** Free-play: uses the speed chosen in the menu and a normal random board. */
+    fun startNormalGame() {
+        if (_uiState.value.gameState == GameState.PLAYING) return
+        if (_uiState.value.isDaily) engine = GameEngine()
+        _uiState.update { it.copy(isDaily = false) }
+        startGame()
+    }
+
+    /** Daily challenge: identical board for every player today, fixed MEDIUM speed. */
+    fun startDailyGame() {
+        if (_uiState.value.gameState == GameState.PLAYING) return
+        val day = todayEpochDay()
+        engine = GameEngine(dailySeed = DailyChallenge.seedFor(day))
+        _uiState.update { it.copy(isDaily = true, dailyDay = day, selectedSpeed = GameSpeed.MEDIUM) }
+        startGame()
     }
 
     fun startGame() {
@@ -95,7 +127,9 @@ class SnakeViewModel(
 
     private fun resetGame() {
         val old = _uiState.value
-        _uiState.value = engine.newGame(old.gridWidth, old.gridHeight, old.selectedSpeed, old.hapticsEnabled)
+        _uiState.value = engine
+            .newGame(old.gridWidth, old.gridHeight, old.selectedSpeed, old.hapticsEnabled)
+            .copy(isDaily = old.isDaily, dailyDay = old.dailyDay)
     }
 
     private fun startGameLoop() {
@@ -137,7 +171,7 @@ class SnakeViewModel(
             is GameEvent.TailGrew -> triggerTailGrowthSparks(event.at.x, event.at.y)
             is GameEvent.LevelUp -> triggerLevelUpSparks(event.at.x, event.at.y)
             is GameEvent.ObstacleSpawned -> triggerLevelUpSparks(event.at.x, event.at.y)
-            GameEvent.GameOver -> onGameOver()
+            is GameEvent.GameOver -> onGameOver()
         }
     }
 
@@ -177,6 +211,12 @@ class SnakeViewModel(
 
     private fun onGameOver() {
         gameLoopJob?.cancel()
+
+        val finished = _uiState.value
+        val updated = StreakLogic.recordRun(_stats.value, todayEpochDay(), finished.score, finished.isDaily)
+        _stats.value = updated
+        statsStorage.save(updated)
+        _uiState.update { it.copy(roast = Roasts.forGameOver(it.score, it.deathCause)) }
 
         // Explosion from every snake segment
         _uiState.value.snake.forEach { pt ->

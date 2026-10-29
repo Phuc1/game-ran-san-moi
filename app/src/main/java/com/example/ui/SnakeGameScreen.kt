@@ -1,8 +1,11 @@
 package com.example.ui
 
+import android.content.Context
+import android.content.Intent
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -17,6 +20,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -36,6 +41,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -78,6 +84,8 @@ fun SnakeGameApp(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val topScores by viewModel.topScores.collectAsStateWithLifecycle()
+    val stats by viewModel.stats.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
 
     // Observe state changes to trigger gentle tactile haptic feedback inside the app
@@ -144,8 +152,12 @@ fun SnakeGameApp(
                         hapticsEnabled = state.hapticsEnabled,
                         onToggleHaptics = { viewModel.toggleHaptics() },
                         topScores = topScores,
-                        onStartGame = { viewModel.startGame() },
-                        onClearScores = { viewModel.clearHighScores() }
+                        onStartGame = { viewModel.startNormalGame() },
+                        onClearScores = { viewModel.clearHighScores() },
+                        dailyLabel = viewModel.todayLabel(),
+                        dailyBest = StreakLogic.dailyBestToday(stats, viewModel.todayEpochDay()),
+                        streak = StreakLogic.activeStreak(stats, viewModel.todayEpochDay()),
+                        onStartDaily = { viewModel.startDailyGame() }
                     )
                 }
                 GameState.PLAYING, GameState.PAUSED, GameState.GAME_OVER -> {
@@ -172,6 +184,25 @@ fun SnakeGameApp(
                 score = state.score,
                 snakeLength = state.snakeLength,
                 speedMode = state.selectedSpeed.label,
+                roast = state.roast,
+                isDaily = state.isDaily,
+                onShare = {
+                    shareText(
+                        context,
+                        ShareText.build(
+                            score = state.score,
+                            snakeLength = state.snakeLength,
+                            modeLabel = state.selectedSpeed.label,
+                            isDaily = state.isDaily,
+                            dayLabel = DailyChallenge.label(state.dailyDay),
+                            streak = StreakLogic.activeStreak(stats, viewModel.todayEpochDay())
+                        )
+                    )
+                },
+                onPlayAgain = {
+                    showSaveDialog = false
+                    viewModel.startGame()
+                },
                 onDismiss = { showSaveDialog = false },
                 onSave = { name ->
                     viewModel.saveScoreOffline(name) {
@@ -181,6 +212,14 @@ fun SnakeGameApp(
             )
         }
     }
+}
+
+private fun shareText(context: Context, text: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    context.startActivity(Intent.createChooser(send, null))
 }
 
 // Custom speed slider or slow float speed for background particles
@@ -196,7 +235,11 @@ fun MainMenuScreen(
     onToggleHaptics: () -> Unit,
     topScores: List<ScoreEntity>,
     onStartGame: () -> Unit,
-    onClearScores: () -> Unit
+    onClearScores: () -> Unit,
+    dailyLabel: String,
+    dailyBest: Int,
+    streak: Int,
+    onStartDaily: () -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "LogoPulse")
     val glowScale by infiniteTransition.animateFloat(
@@ -486,7 +529,7 @@ fun MainMenuScreen(
 
                 // File size reference
                 Text(
-                    text = "SIZE: ~5MB • 60 FPS",
+                    text = "OFFLINE • NHẸ",
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold,
@@ -494,7 +537,34 @@ fun MainMenuScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // DAILY CHALLENGE: same board for everyone today
+            OutlinedButton(
+                onClick = onStartDaily,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+                    .testTag("daily_challenge_button"),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.5.dp, NeonTheme.NeonGold.copy(alpha = 0.8f))
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "THỬ THÁCH HÔM NAY • $dailyLabel",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Black,
+                        color = NeonTheme.NeonGold
+                    )
+                    val sub = buildString {
+                        append(if (dailyBest > 0) "Kỷ lục hôm nay: $dailyBest" else "Cả thế giới chơi chung một bàn")
+                        if (streak >= 1) append(" • 🔥 $streak ngày")
+                    }
+                    Text(text = sub, fontSize = 10.sp, color = NeonTheme.OffWhite.copy(alpha = 0.8f))
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
 
             // PLAY BUTTON
             Button(
@@ -1270,6 +1340,10 @@ fun HighScoreSaveDialog(
     score: Int,
     snakeLength: Int,
     speedMode: String,
+    roast: String,
+    isDaily: Boolean,
+    onShare: () -> Unit,
+    onPlayAgain: () -> Unit,
     onDismiss: () -> Unit,
     onSave: (String) -> Unit
 ) {
@@ -1285,6 +1359,7 @@ fun HighScoreSaveDialog(
                 .padding(24.dp)
         ) {
             Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
@@ -1304,6 +1379,26 @@ fun HighScoreSaveDialog(
                     color = NeonTheme.NeonPink,
                     textAlign = TextAlign.Center
                 )
+
+                if (isDaily) {
+                    Text(
+                        text = "THỬ THÁCH HÔM NAY",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp,
+                        color = NeonTheme.NeonGold
+                    )
+                }
+                if (roast.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = roast,
+                        fontSize = 13.sp,
+                        color = NeonTheme.OffWhite,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.testTag("roast_text")
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -1336,6 +1431,44 @@ fun HighScoreSaveDialog(
                     ) {
                         Text("TỐC ĐỘ", fontSize = 11.sp, color = NeonTheme.MutedGray)
                         Text(speedMode, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = NeonTheme.NeonGold)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onShare,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, NeonTheme.NeonCyan.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("share_score_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = null,
+                            tint = NeonTheme.NeonCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("CHIA SẺ", color = NeonTheme.NeonCyan, fontWeight = FontWeight.Black)
+                    }
+                    Button(
+                        onClick = onPlayAgain,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NeonTheme.NeonPink,
+                            contentColor = NeonTheme.DeepSpace
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("play_again_button")
+                    ) {
+                        Text("CHƠI LẠI", fontWeight = FontWeight.Black)
                     }
                 }
 

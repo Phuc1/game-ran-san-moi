@@ -114,7 +114,8 @@ class GameEngineTest {
     fun hardModeWallKillsWithoutShield() {
         val r = engine().step(playing(snake = line(19, 5, 3), speed = GameSpeed.HARD))
         assertEquals(GameState.GAME_OVER, r.state.gameState)
-        assertTrue(r.events.contains(GameEvent.GameOver))
+        assertTrue(r.events.any { it is GameEvent.GameOver })
+        assertEquals(DeathCause.WALL, r.state.deathCause)
     }
 
     // ---- shield --------------------------------------------------------------------------
@@ -147,6 +148,7 @@ class GameEngineTest {
 
         s = e.step(s).state
         assertEquals(GameState.GAME_OVER, s.gameState)
+        assertEquals(DeathCause.OBSTACLE, s.deathCause)
     }
 
     @Test
@@ -172,6 +174,7 @@ class GameEngineTest {
         val snake = listOf(Point(5, 5), Point(5, 6), Point(4, 6), Point(4, 5), Point(3, 5))
         val next = engine().step(playing(snake = snake, dir = Direction.LEFT)).state
         assertEquals(GameState.GAME_OVER, next.gameState)
+        assertEquals(DeathCause.SELF, next.deathCause)
     }
 
     // ---- food spawning -------------------------------------------------------------------
@@ -257,4 +260,44 @@ class GameEngineTest {
             assertEquals(GameState.IDLE, s.gameState)
         }
     }
+
+    // ---- daily challenge -----------------------------------------------------------------
+
+    @Test
+    fun dailyBoardIsIdenticalForEveryPlayerWithTheSameSeed() {
+        val a = GameEngine(dailySeed = 42L).newGame(20, 20, GameSpeed.MEDIUM)
+        val b = GameEngine(dailySeed = 42L).newGame(20, 20, GameSpeed.MEDIUM)
+        assertEquals(a.obstacles, b.obstacles)
+        assertEquals(a.foods, b.foods)
+    }
+
+    @Test
+    fun dailyBoardDiffersBetweenDays() {
+        val a = GameEngine(dailySeed = 1L).newGame(20, 20, GameSpeed.MEDIUM)
+        val b = GameEngine(dailySeed = 2L).newGame(20, 20, GameSpeed.MEDIUM)
+        assertTrue(a.obstacles != b.obstacles || a.foods != b.foods)
+    }
+
+    @Test
+    fun dailyRestartReproducesTheSameBoard() {
+        val e = GameEngine(dailySeed = 99L)
+        val first = e.newGame(20, 20, GameSpeed.MEDIUM)
+        e.step(first.copy(gameState = GameState.PLAYING)) // consume some engine state
+        val again = e.newGame(20, 20, GameSpeed.MEDIUM)
+        assertEquals(first.obstacles, again.obstacles)
+        assertEquals(first.foods, again.foods)
+    }
+
+    @Test
+    fun dailyNextFoodIsTheSameWhenBoardOccupancyMatches() {
+        fun afterFirstMeal(): List<Food> {
+            val e = GameEngine(dailySeed = 7L)
+            var s = e.newGame(20, 20, GameSpeed.MEDIUM).copy(gameState = GameState.PLAYING)
+            val head = s.snake.first()
+            s = s.copy(foods = listOf(Food(Point(head.x + 1, head.y), FoodType.NORMAL)), obstacles = emptyList())
+            return e.step(s).state.foods
+        }
+        assertEquals(afterFirstMeal(), afterFirstMeal())
+    }
 }
+
