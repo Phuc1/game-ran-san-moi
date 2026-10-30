@@ -13,20 +13,23 @@ android {
     applicationId = "com.aistudio.ransanmoi.gpxvzl"
     minSdk = 24
     targetSdk = 36
-    // Monotonic per pipeline on CI; 1 locally. Play requires it to increase on every upload.
-    versionCode = (System.getenv("CI_PIPELINE_IID") ?: "1").toInt()
-    versionName = "1.0"
+    // Monotonic per CI run; 1 locally. Play requires it to increase on every upload.
+    versionCode = (System.getenv("CI_PIPELINE_IID") ?: System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+    versionName = System.getenv("VERSION_NAME") ?: "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      // Real upload key only when a keystore file is actually provided (GitHub Secrets / local env).
+      val keystorePath = System.getenv("KEYSTORE_PATH")
+      if (!keystorePath.isNullOrBlank() && file(keystorePath).isFile) {
+        storeFile = file(keystorePath)
+        storePassword = System.getenv("STORE_PASSWORD")
+        keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
+        keyPassword = System.getenv("KEY_PASSWORD")
+      }
     }
   }
 
@@ -36,7 +39,10 @@ android {
       isMinifyEnabled = true
       isShrinkResources = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      // No keystore (local/PR builds): sign with the debug key so the R8-optimized APK is still installable for testing.
+      // Never publish such a build; the Release workflow refuses to do so.
+      val releaseSigning = signingConfigs.getByName("release")
+      signingConfig = if (releaseSigning.storeFile != null) releaseSigning else signingConfigs.getByName("debug")
     }
   }
   compileOptions {

@@ -37,3 +37,18 @@ Game rules live in `GameEngine` (pure Kotlin, no Android deps) and are unit-test
 ```
 
 CI (`.gitlab-ci.yml`) runs unit tests + lint on every pipeline, builds a debug APK on branches/MRs and a signed AAB on the default branch and tags.
+
+## Releasing (signed APK + AAB via GitHub Actions)
+
+1. Create an upload key once, locally, and keep it OUT of the repo:
+   ```
+   keytool -genkeypair -v -keystore upload-key.jks -alias upload -keyalg RSA -keysize 2048 -validity 10000
+   ```
+2. Base64 it (PowerShell): `[Convert]::ToBase64String([IO.File]::ReadAllBytes("upload-key.jks")) | Set-Clipboard`
+3. Repo -> Settings -> Secrets and variables -> Actions -> add: `KEYSTORE_BASE64` (the clipboard text), `STORE_PASSWORD`, `KEY_PASSWORD` (alias must be `upload`).
+4. Publish: `git tag v1.0.0 && git push origin v1.0.0`. The **Release** workflow builds, verifies the signature, and attaches `RanSanMoi-<version>.apk` (sideload) and `.aab` (Google Play) to a GitHub Release.
+
+Back up `upload-key.jks` and both passwords somewhere safe: losing them means you cannot update the app under the same signature.
+
+The **Emulator smoke tests** workflow launches the app on Android 7 (API 24), 11 (API 30) and 14 (API 34), runs the UI smoke tests, then installs the R8-minified release build and checks it starts without crashing.
+
