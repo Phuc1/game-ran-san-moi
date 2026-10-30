@@ -1,8 +1,11 @@
 package com.example.ui
 
+import android.content.Context
+import android.content.Intent
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -17,6 +20,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -36,6 +41,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -45,10 +51,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.ScoreEntity
 import com.example.viewmodel.*
 import kotlinx.coroutines.delay
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
@@ -74,6 +84,8 @@ fun SnakeGameApp(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val topScores by viewModel.topScores.collectAsStateWithLifecycle()
+    val stats by viewModel.stats.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
 
     // Observe state changes to trigger gentle tactile haptic feedback inside the app
@@ -87,6 +99,16 @@ fun SnakeGameApp(
         if (state.gameState == GameState.GAME_OVER && state.hapticsEnabled) {
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         }
+    }
+
+    // Pause automatically when the app goes to background (otherwise the snake keeps moving and dies)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) viewModel.pauseGame()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // High Score saving modal state
@@ -130,8 +152,12 @@ fun SnakeGameApp(
                         hapticsEnabled = state.hapticsEnabled,
                         onToggleHaptics = { viewModel.toggleHaptics() },
                         topScores = topScores,
-                        onStartGame = { viewModel.startGame() },
-                        onClearScores = { viewModel.clearHighScores() }
+                        onStartGame = { viewModel.startNormalGame() },
+                        onClearScores = { viewModel.clearHighScores() },
+                        dailyLabel = viewModel.todayLabel(),
+                        dailyBest = StreakLogic.dailyBestToday(stats, viewModel.todayEpochDay()),
+                        streak = StreakLogic.activeStreak(stats, viewModel.todayEpochDay()),
+                        onStartDaily = { viewModel.startDailyGame() }
                     )
                 }
                 GameState.PLAYING, GameState.PAUSED, GameState.GAME_OVER -> {
@@ -144,9 +170,8 @@ fun SnakeGameApp(
                             else viewModel.resumeGame()
                         },
                         onExitClicked = {
-                            viewModel.pauseGame()
                             showSaveDialog = false
-                            viewModel.startGame() // Reset or trigger back
+                            viewModel.exitToMenu()
                         }
                     )
                 }
@@ -159,6 +184,25 @@ fun SnakeGameApp(
                 score = state.score,
                 snakeLength = state.snakeLength,
                 speedMode = state.selectedSpeed.label,
+                roast = state.roast,
+                isDaily = state.isDaily,
+                onShare = {
+                    shareText(
+                        context,
+                        ShareText.build(
+                            score = state.score,
+                            snakeLength = state.snakeLength,
+                            modeLabel = state.selectedSpeed.label,
+                            isDaily = state.isDaily,
+                            dayLabel = DailyChallenge.label(state.dailyDay),
+                            streak = StreakLogic.activeStreak(stats, viewModel.todayEpochDay())
+                        )
+                    )
+                },
+                onPlayAgain = {
+                    showSaveDialog = false
+                    viewModel.startGame()
+                },
                 onDismiss = { showSaveDialog = false },
                 onSave = { name ->
                     viewModel.saveScoreOffline(name) {
@@ -168,6 +212,14 @@ fun SnakeGameApp(
             )
         }
     }
+}
+
+private fun shareText(context: Context, text: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    context.startActivity(Intent.createChooser(send, null))
 }
 
 // Custom speed slider or slow float speed for background particles
@@ -183,7 +235,11 @@ fun MainMenuScreen(
     onToggleHaptics: () -> Unit,
     topScores: List<ScoreEntity>,
     onStartGame: () -> Unit,
-    onClearScores: () -> Unit
+    onClearScores: () -> Unit,
+    dailyLabel: String,
+    dailyBest: Int,
+    streak: Int,
+    onStartDaily: () -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "LogoPulse")
     val glowScale by infiniteTransition.animateFloat(
@@ -473,7 +529,7 @@ fun MainMenuScreen(
 
                 // File size reference
                 Text(
-                    text = "SIZE: ~5MB • 60 FPS",
+                    text = "OFFLINE • NHẸ",
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold,
@@ -481,7 +537,34 @@ fun MainMenuScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // DAILY CHALLENGE: same board for everyone today
+            OutlinedButton(
+                onClick = onStartDaily,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+                    .testTag("daily_challenge_button"),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.5.dp, NeonTheme.NeonGold.copy(alpha = 0.8f))
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "THỬ THÁCH HÔM NAY • $dailyLabel",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Black,
+                        color = NeonTheme.NeonGold
+                    )
+                    val sub = buildString {
+                        append(if (dailyBest > 0) "Kỷ lục hôm nay: $dailyBest" else "Cả thế giới chơi chung một bàn")
+                        if (streak >= 1) append(" • 🔥 $streak ngày")
+                    }
+                    Text(text = sub, fontSize = 10.sp, color = NeonTheme.OffWhite.copy(alpha = 0.8f))
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
 
             // PLAY BUTTON
             Button(
@@ -535,8 +618,6 @@ fun GamePlayLayout(
     onExitClicked: () -> Unit
 ) {
     // Collect swipe gesture events
-    var swipeOffsetStartX by remember { mutableStateOf(0f) }
-    var swipeOffsetStartY by remember { mutableStateOf(0f) }
     val density = LocalDensity.current
 
     // Request keyboard focus for laptop arrow & WASD keys
@@ -767,32 +848,24 @@ fun GamePlayLayout(
                 .background(NeonTheme.DeepSpace)
                 .border(2.dp, NeonTheme.GridAccent, RoundedCornerShape(18.dp))
                 .pointerInput(Unit) {
+                    // Accumulate drag distance; emit one turn per threshold crossing, then reset.
+                    var acc = Offset.Zero
+                    val threshold = viewConfiguration.touchSlop * 2f
                     detectDragGestures(
-                        onDragStart = { offset ->
-                            swipeOffsetStartX = offset.x
-                            swipeOffsetStartY = offset.y
-                        },
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                        },
-                        onDragEnd = {
-                            val diffX = swipeOffsetStartX
-                            val diffY = swipeOffsetStartY
-                            // Compute swipe calculations manually to give 100% swipe responsive controls
-                        }
-                    )
-                }
-                .pointerInput(Unit) {
-                    // Simpler gesture swipe detector
-                    detectDragGestures { change, dragAmount ->
+                        onDragStart = { acc = Offset.Zero },
+                        onDragEnd = { acc = Offset.Zero },
+                        onDragCancel = { acc = Offset.Zero }
+                    ) { change, dragAmount ->
                         change.consume()
-                        val (x, y) = dragAmount
-                        if (Math.abs(x) > Math.abs(y)) {
-                            if (x > 15f) onDirectionChange(Direction.RIGHT)
-                            else if (x < -15f) onDirectionChange(Direction.LEFT)
-                        } else {
-                            if (y > 15f) onDirectionChange(Direction.DOWN)
-                            else if (y < -15f) onDirectionChange(Direction.UP)
+                        acc += dragAmount
+                        if (abs(acc.x) > threshold || abs(acc.y) > threshold) {
+                            val dir = if (abs(acc.x) > abs(acc.y)) {
+                                if (acc.x > 0) Direction.RIGHT else Direction.LEFT
+                            } else {
+                                if (acc.y > 0) Direction.DOWN else Direction.UP
+                            }
+                            onDirectionChange(dir)
+                            acc = Offset.Zero
                         }
                     }
                 }
@@ -1267,6 +1340,10 @@ fun HighScoreSaveDialog(
     score: Int,
     snakeLength: Int,
     speedMode: String,
+    roast: String,
+    isDaily: Boolean,
+    onShare: () -> Unit,
+    onPlayAgain: () -> Unit,
     onDismiss: () -> Unit,
     onSave: (String) -> Unit
 ) {
@@ -1282,6 +1359,7 @@ fun HighScoreSaveDialog(
                 .padding(24.dp)
         ) {
             Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
@@ -1301,6 +1379,26 @@ fun HighScoreSaveDialog(
                     color = NeonTheme.NeonPink,
                     textAlign = TextAlign.Center
                 )
+
+                if (isDaily) {
+                    Text(
+                        text = "THỬ THÁCH HÔM NAY",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp,
+                        color = NeonTheme.NeonGold
+                    )
+                }
+                if (roast.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = roast,
+                        fontSize = 13.sp,
+                        color = NeonTheme.OffWhite,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.testTag("roast_text")
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -1333,6 +1431,44 @@ fun HighScoreSaveDialog(
                     ) {
                         Text("TỐC ĐỘ", fontSize = 11.sp, color = NeonTheme.MutedGray)
                         Text(speedMode, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = NeonTheme.NeonGold)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onShare,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, NeonTheme.NeonCyan.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("share_score_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = null,
+                            tint = NeonTheme.NeonCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("CHIA SẺ", color = NeonTheme.NeonCyan, fontWeight = FontWeight.Black)
+                    }
+                    Button(
+                        onClick = onPlayAgain,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NeonTheme.NeonPink,
+                            contentColor = NeonTheme.DeepSpace
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("play_again_button")
+                    ) {
+                        Text("CHƠI LẠI", fontWeight = FontWeight.Black)
                     }
                 }
 

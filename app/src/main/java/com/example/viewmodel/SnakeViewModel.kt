@@ -14,72 +14,26 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.TimeZone
 import kotlin.random.Random
 
-enum class Direction {
-    UP, DOWN, LEFT, RIGHT
-}
-
-enum class GameState {
-    IDLE, PLAYING, PAUSED, GAME_OVER
-}
-
-enum class FoodType {
-    NORMAL,  // Red, +10 score, small explosion
-    PORTAL,  // Gold, +30 score, wraps grid instantly, massive warp sparks
-    SHIELD   // Green, +20 score, gives temporary armor to pass through wall/self once
-}
-
-data class Point(val x: Int, val y: Int)
-
-data class Food(val point: Point, val type: FoodType)
-
-data class Particle(
-    val x: Float,
-    val y: Float,
-    val vx: Float,
-    val vy: Float,
-    val size: Float,
-    val color: Long, // Hex color
-    var alpha: Float,
-    val decay: Float,
-    val rotation: Float = 0f,
-    val rotationSpeed: Float = 0f
-)
-
-enum class GameSpeed(val label: String, val ms: Long, val hasWalls: Boolean) {
-    EASY("DỄ", 350L, false),
-    MEDIUM("TRUNG BÌNH", 260L, false),
-    HARD("KHÓ", 180L, true),
-    HYPER_4D("HYPER 4D", 120L, true)
-}
-
-data class GameUiState(
-    val snake: List<Point> = emptyList(),
-    val direction: Direction = Direction.RIGHT,
-    val foods: List<Food> = emptyList(),
-    val obstacles: List<Point> = emptyList(),
-    val score: Int = 0,
-    val snakeLength: Int = 3,
-    val level: Int = 1,
-    val currentSpeedMs: Long = 150L,
-    val gameState: GameState = GameState.IDLE,
-    val hasShield: Boolean = false,
-    val borderCollision: Boolean = false,
-    val cameraShake: Float = 0f,
-    val selectedSpeed: GameSpeed = GameSpeed.MEDIUM,
-    val isWarpActive: Boolean = false,
-    val hapticsEnabled: Boolean = true,
-    val gridWidth: Int = 20,
-    val gridHeight: Int = 20
-)
-
+/**
+ * Thin Android layer: owns coroutines, Room and particles. All game rules live in [GameEngine]
+ * (pure Kotlin, unit-tested), and this class only reacts to the [GameEvent]s it emits.
+ */
 class SnakeViewModel(
-    private val repository: ScoreRepository
+    private val repository: ScoreRepository,
+    private val statsStorage: StatsStorage,
+    private var engine: GameEngine = GameEngine(),
+    private val clock: () -> Long = { System.currentTimeMillis() }
 ) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(GameUiState())
+    private val _uiState = MutableStateFlow(engine.newGame(DEFAULT_GRID, DEFAULT_GRID, GameSpeed.MEDIUM))
     val uiState: StateFlow<GameUiState> = _uiState.asStateFlow()
+
+    // Streak + daily best (persisted in SharedPreferences)
+    private val _stats = MutableStateFlow(statsStorage.load())
+    val stats: StateFlow<PlayerStats> = _stats.asStateFlow()
 
     // Top scores observed reactively from Room
     val topScores: StateFlow<List<ScoreEntity>> = repository.getTopScores(10)
@@ -89,31 +43,18 @@ class SnakeViewModel(
             initialValue = emptyList()
         )
 
-    // Particles list for seamless 60fps neon dust emission in Compose Canvas
+    // Particles drawn by the Compose canvas
     val particles = mutableStateListOf<Particle>()
 
     private var gameLoopJob: Job? = null
-    private var particleLoopJob: Job? = null
-    private var timeMillis = 0L
-
-    init {
-        resetGame()
-        startParticleSimulation()
-    }
-
-    private fun calculateSpeedMs(level: Int, speed: GameSpeed): Long {
-        val baseMs = speed.ms
-        // Gradually speeds up by 15ms per level
-        val decrement = (level - 1) * 15L
-        return (baseMs - decrement).coerceAtLeast(40L)
-    }
+    private var effectsJob: Job? = null
 
     fun selectSpeed(speed: GameSpeed) {
-        _uiState.update { 
+        _uiState.update {
             it.copy(
                 selectedSpeed = speed,
-                currentSpeedMs = calculateSpeedMs(it.level, speed)
-            ) 
+                currentSpeedMs = engine.speedMs(it.level, speed)
+            )
         }
     }
 
@@ -122,23 +63,41 @@ class SnakeViewModel(
     }
 
     fun changeDirection(newDir: Direction) {
-        val currentDir = _uiState.value.direction
-        // Prevent 180-degree immediate reverse collisions
-        val isValid = when (newDir) {
-            Direction.UP -> currentDir != Direction.DOWN
-            Direction.DOWN -> currentDir != Direction.UP
-            Direction.LEFT -> currentDir != Direction.RIGHT
-            Direction.RIGHT -> currentDir != Direction.LEFT
-        }
-        if (isValid && _uiState.value.gameState == GameState.PLAYING) {
-            _uiState.update { it.copy(direction = newDir) }
-        }
+        val state = _uiState.value
+        if (state.gameState != GameState.PLAYING) return
+        engine.queueDirection(state.direction, newDir)
+    }
+
+    /** Local-calendar day number (same for everyone in the same timezone and date). */
+    fun todayEpochDay(): Long {
+        val now = clock()
+        return DailyChallenge.epochDay(now, TimeZone.getDefault().getOffset(now))
+    }
+
+    fun todayLabel(): String = DailyChallenge.label(todayEpochDay())
+
+    /** Free-play: uses the speed chosen in the menu and a normal random board. */
+    fun startNormalGame() {
+        if (_uiState.value.gameState == GameState.PLAYING) return
+        if (_uiState.value.isDaily) engine = GameEngine()
+        _uiState.update { it.copy(isDaily = false) }
+        startGame()
+    }
+
+    /** Daily challenge: identical board for every player today, fixed MEDIUM speed. */
+    fun startDailyGame() {
+        if (_uiState.value.gameState == GameState.PLAYING) return
+        val day = todayEpochDay()
+        engine = GameEngine(dailySeed = DailyChallenge.seedFor(day))
+        _uiState.update { it.copy(isDaily = true, dailyDay = day, selectedSpeed = GameSpeed.MEDIUM) }
+        startGame()
     }
 
     fun startGame() {
-        if (_uiState.value.gameState == GameState.PLAYING) return
-        
-        if (_uiState.value.gameState == GameState.GAME_OVER || _uiState.value.gameState == GameState.IDLE) {
+        val state = _uiState.value
+        if (state.gameState == GameState.PLAYING) return
+
+        if (state.gameState == GameState.GAME_OVER || state.gameState == GameState.IDLE) {
             resetGame()
         }
 
@@ -160,236 +119,37 @@ class SnakeViewModel(
         }
     }
 
+    fun exitToMenu() {
+        gameLoopJob?.cancel()
+        particles.clear()
+        resetGame() // back to IDLE (menu)
+    }
+
     private fun resetGame() {
-        val w = _uiState.value.gridWidth
-        val h = _uiState.value.gridHeight
-        val startLength = 3
-        val initialSnake = mutableListOf<Point>()
-        val startY = h / 2
-        for (i in startLength - 1 downTo 0) {
-            initialSnake.add(Point((w / 4) + i, startY))
-        }
-
-        val initialSpeed = _uiState.value.selectedSpeed
-
-        // Dynamic initial obstacle spawning count based on speed mode chosen
-        val obstacleCount = when (initialSpeed) {
-            GameSpeed.EASY -> 2
-            GameSpeed.MEDIUM -> 4
-            GameSpeed.HARD -> 7
-            GameSpeed.HYPER_4D -> 10
-        }
-        val initialObstacles = mutableListOf<Point>()
-        while (initialObstacles.size < obstacleCount) {
-            val p = Point(Random.nextInt(w), Random.nextInt(h))
-            // Ensure no obstacles spawn too close to the starting snake's horizontal placement
-            val nearSnake = Math.abs(p.y - startY) <= 1 && p.x >= (w / 4 - 2) && p.x <= (w / 4 + startLength + 3)
-            if (!nearSnake && !initialObstacles.contains(p)) {
-                initialObstacles.add(p)
-            }
-        }
-
-        _uiState.value = GameUiState(
-            snake = initialSnake,
-            direction = Direction.RIGHT,
-            foods = emptyList(),
-            obstacles = initialObstacles,
-            score = 0,
-            snakeLength = startLength,
-            level = 1,
-            currentSpeedMs = calculateSpeedMs(1, initialSpeed),
-            gameState = GameState.IDLE,
-            hasShield = false,
-            borderCollision = false,
-            cameraShake = 0f,
-            selectedSpeed = initialSpeed,
-            hapticsEnabled = _uiState.value.hapticsEnabled,
-            gridWidth = w,
-            gridHeight = h
-        )
-
-        // Spawn first batch of food
-        spawnFood()
+        val old = _uiState.value
+        _uiState.value = engine
+            .newGame(old.gridWidth, old.gridHeight, old.selectedSpeed, old.hapticsEnabled)
+            .copy(isDaily = old.isDaily, dailyDay = old.dailyDay)
     }
 
     private fun startGameLoop() {
         gameLoopJob?.cancel()
         gameLoopJob = viewModelScope.launch {
             while (_uiState.value.gameState == GameState.PLAYING) {
-                val delayTime = _uiState.value.currentSpeedMs
-                delay(delayTime)
+                delay(_uiState.value.currentSpeedMs)
                 gameTick()
             }
         }
     }
 
-    private fun startParticleSimulation() {
-        particleLoopJob?.cancel()
-        particleLoopJob = viewModelScope.launch {
-            while (true) {
-                delay(16L) // ~60 FPS
-                timeMillis += 16L
-                updateParticles()
-                decayCameraShake()
-            }
-        }
-    }
-
     private fun gameTick() {
-        val state = _uiState.value
-        val snake = state.snake.toMutableList()
-        val head = snake.first()
-        val dir = state.direction
+        val result = engine.step(_uiState.value)
+        _uiState.value = result.state
+        result.events.forEach(::handleEvent)
 
-        // Compute next head position
-        var nextX = head.x
-        var nextY = head.y
-
-        when (dir) {
-            Direction.UP -> nextY -= 1
-            Direction.DOWN -> nextY += 1
-            Direction.LEFT -> nextX -= 1
-            Direction.RIGHT -> nextX += 1
-        }
-
-        val hasWalls = state.selectedSpeed.hasWalls
-        val w = state.gridWidth
-        val h = state.gridHeight
-
-        // Wall collision check / Wrap around
-        if (nextX < 0 || nextX >= w || nextY < 0 || nextY >= h) {
-            if (hasWalls) {
-                if (state.hasShield) {
-                    // Expend shield instead of death, wrap anyway
-                    _uiState.update { it.copy(hasShield = false, cameraShake = 0.4f) }
-                    triggerShieldSparks(nextX, nextY)
-                    nextX = (nextX + w) % w
-                    nextY = (nextY + h) % h
-                } else {
-                    triggerGameOver()
-                    return
-                }
-            } else {
-                // Wrap around
-                nextX = (nextX + w) % w
-                nextY = (nextY + h) % h
-            }
-        }
-
-        val nextHead = Point(nextX, nextY)
-
-        // Self-collision checking
-        if (snake.contains(nextHead) && nextHead != snake.last()) {
-            if (state.hasShield) {
-                _uiState.update { it.copy(hasShield = false, cameraShake = 0.5f) }
-                triggerShieldSparks(nextHead.x, nextHead.y)
-            } else {
-                triggerGameOver()
-                return
-            }
-        }
-
-        // Obstacle-collision checking
-        if (state.obstacles.contains(nextHead)) {
-            if (state.hasShield) {
-                // Shield shatters, destroys obstacle satisfyingly!
-                val updatedObstacles = state.obstacles.filter { it != nextHead }
-                _uiState.update { it.copy(obstacles = updatedObstacles, hasShield = false, cameraShake = 0.6f) }
-                triggerShieldSparks(nextHead.x, nextHead.y)
-            } else {
-                triggerGameOver()
-                return
-            }
-        }
-
-        // Add head
-        snake.add(0, nextHead)
-
-        // Check if head eats food
-        var foodIndex = -1
-        for (i in state.foods.indices) {
-            if (state.foods[i].point == nextHead) {
-                foodIndex = i
-                break
-            }
-        }
-
-        if (foodIndex != -1) {
-            // Ate food!
-            val eatenFood = state.foods[foodIndex]
-            val scoreGained = when (eatenFood.type) {
-                FoodType.NORMAL -> 10
-                FoodType.PORTAL -> 30
-                FoodType.SHIELD -> 20
-            }
-
-            var shieldState = state.hasShield
-            if (eatenFood.type == FoodType.SHIELD) {
-                shieldState = true
-            }
-
-            // Spawn explosive particle sparks on eaten food
-            triggerFoodConsumptionSparks(nextHead.x, nextHead.y, eatenFood.type)
-
-            // Trigger score increment & camera shake
-            val newScore = state.score + scoreGained
-            val multiplier = if (state.selectedSpeed == GameSpeed.HYPER_4D) 1.5 else 1.0
-            val finalScore = (newScore * multiplier).toInt()
-
-            val newLength = state.snakeLength + 1
-            val newLevel = ((newLength - 3) / 3) + 1
-            val nextSpeedMs = calculateSpeedMs(newLevel, state.selectedSpeed)
-            val levelUpTriggered = newLevel > state.level
-
-            val newObstacles = state.obstacles.toMutableList()
-            if (levelUpTriggered) {
-                triggerLevelUpSparks(nextHead.x, nextHead.y)
-                // Add new obstacles dynamically as difficulty increases with levels!
-                var attempts = 0
-                while (attempts < 50) {
-                    val p = Point(Random.nextInt(w), Random.nextInt(h))
-                    if (!snake.contains(p) && state.foods.none { it.point == p } && !newObstacles.contains(p)) {
-                        newObstacles.add(p)
-                        triggerLevelUpSparks(p.x, p.y) // Beautiful sparks at new obstacle position
-                        break
-                    }
-                    attempts++
-                }
-            }
-
-            _uiState.update {
-                it.copy(
-                    score = finalScore,
-                    snakeLength = newLength,
-                    level = newLevel,
-                    currentSpeedMs = nextSpeedMs,
-                    hasShield = shieldState,
-                    obstacles = newObstacles,
-                    cameraShake = if (levelUpTriggered) 0.7f else 0.3f,
-                    isWarpActive = eatenFood.type == FoodType.PORTAL
-                )
-            }
-
-            // Spawn ambient sparkle around head
-            triggerTailGrowthSparks(snake.last().x, snake.last().y)
-
-            // Spawn new foods
-            val currentFoods = state.foods.toMutableList()
-            currentFoods.removeAt(foodIndex)
-            _uiState.update { it.copy(foods = currentFoods) }
-            
-            spawnFood()
-        } else {
-            // Keep length constant - remove tail
-            if (snake.size > state.snakeLength) {
-                snake.removeAt(snake.size - 1)
-            }
-        }
-
-        _uiState.update { it.copy(snake = snake) }
-
-        // Spawn a subtle tail trail spark occasionally
-        if (Random.nextFloat() < 0.2f && snake.isNotEmpty()) {
+        // Subtle tail trail spark
+        val snake = result.state.snake
+        if (Random.nextFloat() < 0.2f && snake.isNotEmpty() && result.state.gameState == GameState.PLAYING) {
             val tail = snake.last()
             addParticle(
                 x = tail.x + 0.5f,
@@ -397,48 +157,34 @@ class SnakeViewModel(
                 vx = (Random.nextFloat() - 0.5f) * 0.05f,
                 vy = (Random.nextFloat() - 0.5f) * 0.05f,
                 size = 6f + Random.nextFloat() * 8f,
-                color = 0xFF8A2BE2, // Purple
+                color = 0xFF8A2BE2,
                 decay = 0.04f
             )
         }
+        kickEffects()
     }
 
-    private fun spawnFood() {
-        val state = _uiState.value
-        val currentFoods = state.foods.toMutableList()
-        val snake = state.snake
-        val w = state.gridWidth
-        val h = state.gridHeight
-
-        // Generate food items so they don't overlap snake or other foods
-        val requiredFoodCount = if (state.selectedSpeed == GameSpeed.HYPER_4D) 3 else 1
-        
-        while (currentFoods.size < requiredFoodCount) {
-            var attempts = 0
-            var foundPoint: Point? = null
-            while (attempts < 100) {
-                val p = Point(Random.nextInt(w), Random.nextInt(h))
-                if (!snake.contains(p) && currentFoods.none { it.point == p } && !state.obstacles.contains(p)) {
-                    foundPoint = p
-                    break
-                }
-                attempts++
-            }
-
-            val targetPoint = foundPoint ?: Point(Random.nextInt(w), Random.nextInt(h))
-
-            // Choose food type with neon-balancing
-            val roll = Random.nextFloat()
-            val type = when {
-                roll < 0.12f -> FoodType.SHIELD // Green Shield
-                roll < 0.28f -> FoodType.PORTAL // Golden Portal
-                else -> FoodType.NORMAL        // Crimson Core
-            }
-
-            currentFoods.add(Food(targetPoint, type))
+    private fun handleEvent(event: GameEvent) {
+        when (event) {
+            is GameEvent.ShieldBroken -> triggerShieldSparks(event.at.x, event.at.y)
+            is GameEvent.FoodEaten -> triggerFoodConsumptionSparks(event.at.x, event.at.y, event.type)
+            is GameEvent.TailGrew -> triggerTailGrowthSparks(event.at.x, event.at.y)
+            is GameEvent.LevelUp -> triggerLevelUpSparks(event.at.x, event.at.y)
+            is GameEvent.ObstacleSpawned -> triggerLevelUpSparks(event.at.x, event.at.y)
+            is GameEvent.GameOver -> onGameOver()
         }
+    }
 
-        _uiState.update { it.copy(foods = currentFoods) }
+    // Runs only while there is something to animate; stops by itself (no idle 60 Hz loop).
+    private fun kickEffects() {
+        if (effectsJob?.isActive == true) return
+        effectsJob = viewModelScope.launch {
+            while (particles.isNotEmpty() || _uiState.value.cameraShake > 0f) {
+                delay(16L)
+                updateParticles()
+                decayCameraShake()
+            }
+        }
     }
 
     fun saveScoreOffline(playerName: String, onFinished: () -> Unit) {
@@ -463,14 +209,17 @@ class SnakeViewModel(
         }
     }
 
-    private fun triggerGameOver() {
-        _uiState.update { it.copy(gameState = GameState.GAME_OVER, cameraShake = 0.9f) }
+    private fun onGameOver() {
         gameLoopJob?.cancel()
 
-        // Cataclysmic graphic explosion spark burst on entire board!
-        val snake = _uiState.value.snake
-        snake.forEach { pt ->
-            // Explosion sparks spawning from every segment
+        val finished = _uiState.value
+        val updated = StreakLogic.recordRun(_stats.value, todayEpochDay(), finished.score, finished.isDaily)
+        _stats.value = updated
+        statsStorage.save(updated)
+        _uiState.update { it.copy(roast = Roasts.forGameOver(it.score, it.deathCause)) }
+
+        // Explosion from every snake segment
+        _uiState.value.snake.forEach { pt ->
             for (i in 0..3) {
                 addParticle(
                     x = pt.x + 0.5f,
@@ -491,6 +240,7 @@ class SnakeViewModel(
         if (particles.size > 200) {
             particles.removeAt(0) // Prevent memory/allocation bloat, keeping sizing featherweight!
         }
+        kickEffects()
         particles.add(
             Particle(
                 x = x,
@@ -609,5 +359,9 @@ class SnakeViewModel(
                 decay = 0.02f + Random.nextFloat() * 0.02f
             )
         }
+    }
+
+    private companion object {
+        const val DEFAULT_GRID = 20
     }
 }

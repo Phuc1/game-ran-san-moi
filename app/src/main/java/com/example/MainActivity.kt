@@ -12,6 +12,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.example.data.AppDatabase
 import com.example.data.ScoreRepository
+import com.example.data.SharedPrefsStatsStorage
 import com.example.ui.NeonTheme
 import com.example.ui.SnakeGameApp
 import com.example.ui.theme.MyApplicationTheme
@@ -28,7 +29,7 @@ class MainActivity : ComponentActivity() {
         object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                return SnakeViewModel(repository) as T
+                return SnakeViewModel(repository, SharedPrefsStatsStorage(applicationContext)) as T
             }
         }
     }

@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["fix/**"]
+    paths: [".github/workflows/release.yml", "app/build.gradle.kts"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to publish a GitHub Release for tags
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare signing key
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload-key.jks"
+            echo "path=$RUNNER_TEMP/upload-key.jks" >> "$GITHUB_OUTPUT"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Signing secrets not set: building with the DEBUG key (test only, not publishable)."
+          fi
+
+      - name: Refuse to publish an unsigned/debug-signed tag build
+        if: startsWith(github.ref, 'refs/tags/') && steps.signing.outputs.signed != 'true'
+        run: |
+          echo "::error::Tag builds need KEYSTORE_BASE64, STORE_PASSWORD and KEY_PASSWORD repository secrets."
+          exit 1
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="0.0.${GITHUB_RUN_NUMBER}-test"; fi
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests, release APK and AAB
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ steps.signing.outputs.path }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+        run: ./gradlew testDebugUnitTest assembleRelease bundleRelease --stacktrace --console=plain 2>&1 | tee -a build.log
+
+      - name: Collect outputs
+        run: |
+          V="${{ steps.ver.outputs.name }}"
+          mkdir -p dist
+          cp app/build/outputs/apk/release/*.apk "dist/RanSanMoi-$V.apk"
+          cp app/build/outputs/bundle/release/*.aab "dist/RanSanMoi-$V.aab"
+          cp app/build/outputs/mapping/release/mapping.txt "dist/mapping-$V.txt"
+          ls -la dist
+
+      - name: Verify APK signature and SDK range
+        run: |
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BT/apksigner"
+          AAPT2="$ANDROID_HOME/build-tools/$BT/aapt2"
+          "$APKSIGNER" verify --verbose --print-certs dist/RanSanMoi-*.apk | grep -E "Verifies|Verified using|Signer #1 certificate DN|Number of signers"
+          "$AAPT2" dump badging dist/RanSanMoi-*.apk | grep -E "^package:|^sdkVersion|^targetSdkVersion|^native-code" || true
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.ver.outputs.name }}
+          path: dist/
+          retention-days: 30
+
+      - name: Publish test pre-release (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          if [ "$SIGNED" = "true" ]; then SIGNER="upload"; else SIGNER="DEBUG"; fi
+          gh release delete release-test --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create release-test dist/*.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Release-build test APK (R8)" \
+            --notes "R8-minified release build for device testing, signed with the $SIGNER key. Commit: $GITHUB_SHA. Not the file to upload to Play (use the AAB from a tagged release)."
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/') && steps.signing.outputs.signed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.apk dist/*.aab --repo "$GITHUB_REPOSITORY" \
+            --title "Rắn Săn Mồi $GITHUB_REF_NAME" --generate-notes
+
+      - name: Surface Gradle errors as annotations
+        if: failure()
+        run: python3 .github/scripts/surface_errors.py build.log
